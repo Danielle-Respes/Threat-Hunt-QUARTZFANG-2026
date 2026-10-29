@@ -1,0 +1,250 @@
+// =====================================================================
+// Operation QUARTZFANG (2026) — KQL used in the hunt
+// Platform: Microsoft Sentinel, workspace LAW-HuntPractice
+// Window:   20 September 2026, 06:30–08:30 UTC
+//
+// Notes
+// - MDE tables (Device*_CL) use Timestamp + DeviceName; custom tables use
+//   TimeGenerated + Computer.
+// - LLMAgentLogs_CL and ContainerRegistryLog_CL were ingested with October
+//   dates, so filter them by HuntName / a wide ago() range instead of the
+//   20 Sept window.
+// - Many rows are duplicated at ingestion; de-duplicate before counting.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// Section 1 — Initial Access
+// ---------------------------------------------------------------------
+
+// Q1: Find the endpoint hit by a rejected + accepted pair from one source
+PortalAccessLog_CL
+| where TimeGenerated between (datetime(2026-09-20 06:30) .. datetime(2026-09-20 06:55))
+| where Computer has "sc-portal01"
+| extend UrlPath = tostring(split(UrlOriginal, "?")[0])
+| summarize Requests = count(),
+            Statuses = make_set(HttpStatusCode),
+            First = min(TimeGenerated),
+            Last = max(TimeGenerated)
+    by SrcIpAddr, UrlPath
+| where Requests >= 2 and array_length(Statuses) >= 2
+| extend GapSeconds = datetime_diff('second', Last, First)
+| order by GapSeconds asc;
+
+// Q2/Q3: Scheme probing and the self-correct (file:// -> gopher://)
+PortalAccessLog_CL
+| where TimeGenerated between (datetime(2026-09-20 06:44) .. datetime(2026-09-20 06:55))
+| where SrcIpAddr == "203.0.113.87"
+| extend Scheme = extract(@"=([a-zA-Z][a-zA-Z0-9+.\-]*://)", 1, UrlOriginal)
+| sort by TimeGenerated asc
+| extend GapFromPrev = datetime_diff('second', TimeGenerated, prev(TimeGenerated))
+| project TimeGenerated, HttpStatusCode, Scheme, GapFromPrev, UrlOriginal;
+
+// Q4: Decode the gopher payload sent to Redis
+PortalAccessLog_CL
+| where TimeGenerated between (datetime(2026-09-20 06:30) .. datetime(2026-09-20 08:30))
+| where SrcIpAddr == "203.0.113.87" and UrlOriginal has "gopher"
+| take 1
+| project Decoded = url_decode(UrlOriginal);
+
+// Q4: Cron executing the Redis-written payload
+Syslog
+| where TimeGenerated between (datetime(2026-09-20 06:52) .. datetime(2026-09-20 07:05))
+| where Computer has "sc-portal01"
+| project TimeGenerated, ProcessName, SyslogMessage
+| order by TimeGenerated asc;
+
+// Q4: Process proving RCE (python3 spawned by cron, as root)
+DeviceProcessEvents_CL
+| where Timestamp between (datetime(2026-09-20 06:52) .. datetime(2026-09-20 07:05))
+| where DeviceName has "sc-portal01"
+| project Timestamp, AccountName, InitiatingProcessFileName, FileName,
+          ProcessCommandLine, ProcessId, InitiatingProcessId
+| order by Timestamp asc;
+
+
+// ---------------------------------------------------------------------
+// Section 2 — Credential Harvest
+// ---------------------------------------------------------------------
+
+// Q1: File-read burst on sc-portal01
+DeviceFileEvents_CL
+| where Timestamp between (datetime(2026-09-20 07:00) .. datetime(2026-09-20 07:10))
+| where DeviceName has "sc-portal01"
+| summarize Reads = count(), First = min(Timestamp), Last = max(Timestamp)
+    by ActionType, FolderPath, FileName, InitiatingProcessFileName
+| order by First asc;
+
+// Q1: Commands run under the reverse shell (cat, env, find)
+DeviceProcessEvents_CL
+| where Timestamp between (datetime(2026-09-20 06:58) .. datetime(2026-09-20 07:12))
+| where DeviceName has "sc-portal01"
+| where AccountName == "root"
+| project Timestamp, AccountName, InitiatingProcessFileName, InitiatingProcessId,
+          FileName, ProcessId, ProcessCommandLine
+| order by Timestamp asc;
+
+// Q2/Q3: Config file contents, as recorded by the attacker agent
+LLMAgentLogs_CL
+| where TimeGenerated > ago(60d)
+| where HuntName == "quartzfang"
+| where * has "/etc/semicrest/portal.conf";
+
+// Q4: Visibility gap — is the env output recorded anywhere?
+LLMAgentLogs_CL
+| where TimeGenerated > ago(60d)
+| where HuntName == "quartzfang" and * has "quartzfang-agent"
+| where * has "env" or * has "environment"
+| project TimeGenerated, tool_name, model_response, tool_result;
+
+
+// ---------------------------------------------------------------------
+// Section 3 — Lateral Movement
+// ---------------------------------------------------------------------
+
+// Q1/Q2: Database statements and connections on sc-db01
+Syslog
+| where TimeGenerated between (datetime(2026-09-20 07:00) .. datetime(2026-09-20 07:40))
+| where Computer has "sc-db01"
+| where SyslogMessage has "statement" or SyslogMessage has "connection"
+| project TimeGenerated, ProcessName, SyslogMessage
+| order by TimeGenerated asc;
+
+// Q3: ci-builder baseline vs attack-window operations by source IP
+ContainerRegistryLog_CL
+| where TimeGenerated > ago(60d)
+| where Username has "ci-builder"
+| summarize Count = count(), First = min(TimeGenerated), Last = max(TimeGenerated)
+    by SrcIpAddr, Operation
+| order by SrcIpAddr, First asc;
+
+// Q4: Admin API requests from sc-portal01
+Syslog
+| where TimeGenerated between (datetime(2026-09-20 06:30) .. datetime(2026-09-20 08:30))
+| where Computer has "sc-admin01"
+| where SyslogMessage has "10.5.0.10"
+| project TimeGenerated, ProcessName, SyslogMessage
+| order by TimeGenerated asc;
+
+
+// ---------------------------------------------------------------------
+// Section 4 — AI Hallucination
+// ---------------------------------------------------------------------
+
+// Q1/Q2: Agent claims about secrets and the registry
+LLMAgentLogs_CL
+| where TimeGenerated > ago(60d)
+| where HuntName == "quartzfang" and * has "quartzfang-agent"
+| where * has "secret" or * has "harbor" or * has "layer" or * has "10.5.0.40"
+| project TimeGenerated, tool_name, gate_decision, model_response, tool_result
+| order by TimeGenerated asc;
+
+// Q2: Registry activity from sc-portal01 (what actually happened)
+ContainerRegistryLog_CL
+| where TimeGenerated > ago(60d)
+| where SrcIpAddr == "10.5.0.10"
+| project TimeGenerated, OriginalTime, Username, Operation, Repository, HttpStatusCode
+| order by TimeGenerated asc;
+
+// Q2: Did the claimed db_admin credential ever authenticate?
+Syslog
+| where TimeGenerated between (datetime(2026-09-20 07:30) .. datetime(2026-09-20 08:30))
+| where Computer has "sc-db01" and SyslogMessage has "db_admin";
+
+
+// ---------------------------------------------------------------------
+// Section 5 — Exfiltration and Persistence
+// ---------------------------------------------------------------------
+
+// Q1/Q4: External connections from sc-portal01 by process
+DeviceNetworkEvents_CL
+| where Timestamp between (datetime(2026-09-20 07:00) .. datetime(2026-09-20 08:30))
+| where DeviceName has "sc-portal01"
+| where not(ipv4_is_private(RemoteIP))
+| project Timestamp, InitiatingProcessFileName, InitiatingProcessId, RemoteIP, RemotePort, LocalPort
+| order by Timestamp asc;
+
+// Q1/Q2: Staging and exfil commands under the reverse shell
+DeviceProcessEvents_CL
+| where Timestamp between (datetime(2026-09-20 07:55) .. datetime(2026-09-20 08:30))
+| where DeviceName has "sc-portal01"
+| where AccountName == "root" or InitiatingProcessId == 4401
+| project Timestamp, InitiatingProcessFileName, InitiatingProcessId, FileName,
+          ProcessId, ProcessCommandLine
+| order by Timestamp asc;
+
+// Q1: Staged archive on disk
+DeviceFileEvents_CL
+| where Timestamp between (datetime(2026-09-20 07:40) .. datetime(2026-09-20 08:20))
+| where DeviceName has "sc-portal01"
+| where FolderPath has ".portal-cache"
+| project Timestamp, ActionType, FolderPath, FileName, InitiatingProcessFileName
+| order by Timestamp asc;
+
+// Q3: Persistence account creation
+DeviceEvents_CL
+| where Timestamp between (datetime(2026-09-20 08:20) .. datetime(2026-09-20 08:35))
+| where DeviceName has "sc-portal01"
+| project Timestamp, ActionType, AccountName;
+
+
+// ---------------------------------------------------------------------
+// Section 6 — Reconnaissance and Timing
+// ---------------------------------------------------------------------
+
+// Q1/Q2: Every source hitting the portal before the exploit
+PortalAccessLog_CL
+| where TimeGenerated between (datetime(2026-09-20 06:30) .. datetime(2026-09-20 06:52))
+| where Computer has "sc-portal01"
+| summarize Requests = count(), First = min(TimeGenerated), Last = max(TimeGenerated),
+            Paths = make_set(UrlOriginal, 10), UAs = make_set(UserAgent, 3)
+    by SrcIpAddr
+| order by First asc;
+
+
+// ---------------------------------------------------------------------
+// Section 7 — Autonomy
+// ---------------------------------------------------------------------
+
+// Q1/Q2: Full attacker agent run, with operator directives
+LLMAgentLogs_CL
+| where TimeGenerated > ago(60d)
+| where HuntName == "quartzfang" and * has "quartzfang-agent"
+| extend Operator = tostring(column_ifexists("user_input", ""))
+| project TimeGenerated, Operator, tool_name, gate_decision, gate_reason, model_response
+| order by TimeGenerated asc;
+
+// Agent identities in the log (attacker vs internal assistant)
+LLMAgentLogs_CL
+| where TimeGenerated > ago(60d)
+| where HuntName == "quartzfang"
+| summarize Rows = count() by tostring(column_ifexists("actor", ""));
+
+
+// ---------------------------------------------------------------------
+// Section 8 — Real or Noise
+// ---------------------------------------------------------------------
+
+// Q2: pg_dump history on sc-db01 (baseline schedule)
+DeviceProcessEvents_CL
+| where Timestamp > ago(60d)
+| where DeviceName has "sc-db01"
+| where FileName has "pg_dump" or ProcessCommandLine has "pg_dump"
+| project Timestamp, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| order by Timestamp asc;
+
+Syslog
+| where TimeGenerated > ago(60d)
+| where Computer has "sc-db01" and SyslogMessage has "application_name=pg_dump"
+| project TimeGenerated, ProcessName, SyslogMessage
+| order by TimeGenerated asc;
+
+// Q3: Connection spike content (refusals only, no queries)
+Syslog
+| where TimeGenerated between (datetime(2026-09-20 07:29) .. datetime(2026-09-20 07:40))
+| where Computer has "sc-db01"
+| summarize Count = count() by Kind = case(
+    SyslogMessage has "remaining connection slots", "FATAL slot refusal",
+    SyslogMessage has "connection received", "connection received",
+    SyslogMessage has "statement", "query",
+    "other");
