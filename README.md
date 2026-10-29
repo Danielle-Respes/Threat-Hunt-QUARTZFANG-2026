@@ -1,5 +1,7 @@
 # Operation QUARTZFANG — Threat Hunt Report (2026)
 
+![Operation QUARTZFANG overview: human operator gates, AI agent attack chain from recon to persistence, and the AI fabrications caught](images/quartzfang-overview.png)
+
 **Analyst:** Danielle Respes · **Date:** 29 October 2026 · **Platform:** Microsoft Sentinel (KQL) · **Workspace:** LAW-HuntPractice
 **Scenario:** SemiCrest Technologies, AI-directed espionage reproducing Anthropic's Campaign C0062 · **Result:** 28 / 28 flags solved
 
